@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Stopped long flicker when moving or resizing an omp pane in Warp. Resize no longer borrows the alternate screen there (override with `PI_TUI_RESIZE_IN_PLACE=0`), and a height-only ±1 SIGWINCH during the post-resize cursor probe no longer restarts that borrow.
+
 ## [18.1.14] - 2026-09-07
 
 ### Fixed

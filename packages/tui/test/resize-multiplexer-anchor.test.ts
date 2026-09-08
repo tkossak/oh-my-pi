@@ -97,6 +97,8 @@ const MUX_SIGNALS = [
 	"CMUX_SURFACE_ID",
 	"CMUX_REMOTE_TRANSPORT",
 	"TERM",
+	"TERM_PROGRAM",
+	"PI_TUI_RESIZE_IN_PLACE",
 ] as const;
 
 function useDirectTerminalEnv() {
@@ -119,14 +121,24 @@ function useDirectTerminalEnv() {
 
 describe("resize anchoring inside a terminal multiplexer", () => {
 	let previousTmux: string | undefined;
+	let previousTermProgram: string | undefined;
+	let previousResizeInPlace: string | undefined;
 
 	beforeEach(() => {
 		previousTmux = Bun.env.TMUX;
+		previousTermProgram = Bun.env.TERM_PROGRAM;
+		previousResizeInPlace = Bun.env.PI_TUI_RESIZE_IN_PLACE;
 		Bun.env.TMUX = "/tmp/tmux-1000/default,1,0";
+		delete Bun.env.TERM_PROGRAM;
+		delete Bun.env.PI_TUI_RESIZE_IN_PLACE;
 	});
 	afterEach(() => {
 		if (previousTmux === undefined) delete Bun.env.TMUX;
 		else Bun.env.TMUX = previousTmux;
+		if (previousTermProgram === undefined) delete Bun.env.TERM_PROGRAM;
+		else Bun.env.TERM_PROGRAM = previousTermProgram;
+		if (previousResizeInPlace === undefined) delete Bun.env.PI_TUI_RESIZE_IN_PLACE;
+		else Bun.env.PI_TUI_RESIZE_IN_PLACE = previousResizeInPlace;
 	});
 
 	it("skips the SIGWINCH-side erase so a racing re-layout cannot blank popped scrollback", () => {

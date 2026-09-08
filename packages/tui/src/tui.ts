@@ -88,6 +88,22 @@ const PAINT_END_NO_SYNC = ENABLE_AUTOWRAP;
 const MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h";
 const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1000l";
 
+/**
+ * `PI_TUI_RESIZE_IN_PLACE=1|true` forces in-place resize (no alt-buffer borrow).
+ * `0|false` forces the alt-buffer path even on Warp. Unset defers to detection.
+ */
+function resizeInPlaceOverride(): boolean | null {
+	const override = Bun.env.PI_TUI_RESIZE_IN_PLACE;
+	if (override === "1" || override === "true") return true;
+	if (override === "0" || override === "false") return false;
+	return null;
+}
+
+/** Warp re-reports its size on CSI ?1049h / CSI ?1049l, which 18.x alt-borrow turns into a flicker loop. */
+function reportsSizeOnAltScreenToggle(): boolean {
+	return Bun.env.TERM_PROGRAM?.toLowerCase() === "warpterminal";
+}
+
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
 type StartListener = () => void;
@@ -822,6 +838,11 @@ export class TUI extends Container {
 	#resizeAltActive = false;
 	#resizeSettleTimer: RenderTimer | undefined;
 	#suppressResizeUntil = 0;
+	// Latched when a SIGWINCH during/after an alt-buffer toggle is height-only
+	// ±1 (Warp's echo). Later resizes then skip the alt borrow.
+	#altToggleResizesInPlace = false;
+	#altToggleColumns = 0;
+	#altToggleRows = 0;
 	#resizeScrollbackMode: ResizeScrollbackMode = TUI.#initialResizeScrollbackMode();
 	#resizeReplaySize: string | undefined;
 	// Holds an alternate-screen exit until its replacement full paint can emit it
@@ -1123,8 +1144,19 @@ export class TUI extends Container {
 		this.terminal.start(
 			data => this.#handleInput(data),
 			() => {
+				if (this.#resizeRepaintsInPlace()) {
+					this.requestRender(true);
+					return;
+				}
 				if (this.#resizeProbe) {
-					// The anchor being probed is already stale; restart the transaction.
+					// Warp (and similar hosts) echo a height-only ±1 SIGWINCH on
+					// CSI ?1049l. Restarting the alt borrow here is the flicker loop.
+					// A real geometry change (width, or height delta > 1) still restarts.
+					if (this.#isAltToggleSizeEcho()) {
+						this.#altToggleResizesInPlace = true;
+						this.requestRender(true);
+						return;
+					}
 					this.#cancelResizeProbe();
 					this.#beginResizeAltPaint(true);
 					return;
@@ -1156,6 +1188,24 @@ export class TUI extends Container {
 		}
 		this.requestRender(true, { clearScrollback: options?.clearScrollback === true });
 	}
+
+	#resizeRepaintsInPlace(): boolean {
+		const override = resizeInPlaceOverride();
+		if (override !== null) return override;
+		return reportsSizeOnAltScreenToggle() || this.#altToggleResizesInPlace;
+	}
+
+	#noteAltBufferToggle(): void {
+		this.#altToggleColumns = this.terminal.columns;
+		this.#altToggleRows = this.terminal.rows;
+	}
+
+	#isAltToggleSizeEcho(): boolean {
+		return (
+			this.terminal.columns === this.#altToggleColumns && Math.abs(this.terminal.rows - this.#altToggleRows) <= 1
+		);
+	}
+
 	/**
 	 * Borrow the alternate buffer for stable, history-free resize repainting.
 	 * `restartingProbe` marks a transaction restarted by a SIGWINCH that
@@ -1165,6 +1215,13 @@ export class TUI extends Container {
 	 */
 	#beginResizeAltPaint(restartingProbe = false): void {
 		if (this.#altActive) {
+			if (this.terminal.columns === this.#altEnterWidth && this.terminal.rows !== this.#altEnterHeight) {
+				this.#altToggleResizesInPlace = true;
+			}
+			this.requestRender(true);
+			return;
+		}
+		if (this.#resizeRepaintsInPlace()) {
 			this.requestRender(true);
 			return;
 		}
@@ -1242,6 +1299,7 @@ export class TUI extends Container {
 				this.#providerWindow = [];
 				this.#parkedViewportOffset = 0;
 			}
+			this.#noteAltBufferToggle();
 			this.terminal.write(`${erase}\x1b[?1049h${this.#keyboardEnhancementEnter()}`);
 		}
 		this.#resizeSettleTimer?.cancel();
@@ -1250,6 +1308,7 @@ export class TUI extends Container {
 			if (this.#stopped || !this.#resizeAltActive) return;
 			this.#resizeAltActive = false;
 			this.#suppressResizeUntil = this.#renderScheduler.now() + 100;
+			this.#noteAltBufferToggle();
 			this.terminal.write(`${this.#keyboardEnhancementExit()}\x1b[?1049l`);
 			setAltScreenActive(false);
 			this.#altPreviousLines = [];
@@ -2598,6 +2657,7 @@ export class TUI extends Container {
 			// screen, or Esc/modified keys revert to legacy encoding inside
 			// fullscreen overlays (Ghostty/kitty/iTerm2).
 			const mouseEnter = wantMouseTracking ? MOUSE_TRACKING_ON : "";
+			this.#noteAltBufferToggle();
 			this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}${mouseEnter}`);
 			setAltScreenActive(true);
 			this.terminal.hideCursor();
@@ -2612,6 +2672,7 @@ export class TUI extends Container {
 			const mouseExit = this.#altMouseTrackingActive ? MOUSE_TRACKING_OFF : "";
 			const enhancementExit = this.#keyboardEnhancementExit();
 			const exitSequence = `${mouseExit}${enhancementExit}\x1b[?1049l`;
+			this.#noteAltBufferToggle();
 			// Session replacement finishes while its fullscreen selector still
 			// covers the old normal buffer. Fuse the restore into the destructive
 			// repaint so no stale frame can become visible between writes.
@@ -2631,6 +2692,7 @@ export class TUI extends Container {
 			// stayed frozen. Recover the restored cursor position before any
 			// provider repaint can overwrite history at the stale row.
 			if (width !== this.#altEnterWidth || height !== this.#altEnterHeight) {
+				if (width === this.#altEnterWidth) this.#altToggleResizesInPlace = true;
 				if (this.#frameProvider !== undefined) {
 					this.#beginResizeAnchorProbe();
 					return;

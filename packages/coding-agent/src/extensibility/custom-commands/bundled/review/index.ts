@@ -116,6 +116,15 @@ function extractReviewPrRefsFromText(text: string): ReviewPrRef[] {
 export async function fetchPrReviewTarget(cwd: string, ref: ReviewPrRef): Promise<ResolvedReviewTarget> {
 	try {
 		const lookup = await gh.getOrFetchPrDiff({ cwd, repo: ref.repo, number: ref.number });
+		const pinned =
+			lookup.status !== "disabled" &&
+			gh.retainPrDiffGeneration({
+				repo: ref.repo,
+				number: ref.number,
+				rendered: lookup.rendered,
+				files: lookup.payload.files,
+				fetchedAt: lookup.fetchedAt,
+			});
 		return createResolvedReviewTarget(
 			"pr",
 			`PR ${ref.repo}#${ref.number}`,
@@ -123,6 +132,7 @@ export async function fetchPrReviewTarget(cwd: string, ref: ReviewPrRef): Promis
 			`PR ${ref.repo}#${ref.number} has no diff content available`,
 			{
 				prDiffUrl: `pr://${ref.repo}/${ref.number}/diff`,
+				prDiffQuery: pinned ? `?at=${lookup.fetchedAt}` : "",
 			},
 		);
 	} catch (error) {

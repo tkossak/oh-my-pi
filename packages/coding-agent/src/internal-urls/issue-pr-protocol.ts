@@ -19,6 +19,8 @@
  * - `issue://owner/repo/123?comments=0` — single item, comments suppressed.
  * - `issue://owner/repo?state=closed&limit=20` — list options pass through to
  *   `gh`.
+ * - `pr://owner/repo/123/diff/2?at=<fetchedAt>` — that cached diff generation,
+ *   not whatever the live row is after a background refresh.
  */
 import issueDoc from "../prompts/internal-urls/issue.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
@@ -27,6 +29,7 @@ import {
 	getOrFetchIssue,
 	getOrFetchPr,
 	getOrFetchPrDiff,
+	getPinnedPrDiff,
 	githubIssueJsonWithStateReasonFallback,
 	type PrDiffFile,
 	parsePositiveDecimalInt,
@@ -56,6 +59,8 @@ interface ParsedPrDiff {
 	 */
 	mode: "list" | "all" | "slice";
 	index?: number;
+	/** Cache generation (`?at=`). When set, resolution must not read the live row. */
+	fetchedAt?: number;
 }
 
 interface ParsedList {
@@ -219,18 +224,33 @@ function parseUrl(url: InternalUrl, scheme: Scheme): Parsed {
 	}
 
 	// diffParts has already been validated above; scheme is `pr`.
+	const fetchedAt = parsePinnedDiffGeneration(url);
 	if (diffParts.length === 1) {
-		return { kind: "pr-diff", repo, number: num, mode: "list" };
+		return { kind: "pr-diff", repo, number: num, mode: "list", fetchedAt };
 	}
 	const sub = diffParts[1] ?? "";
 	if (sub === "all") {
-		return { kind: "pr-diff", repo, number: num, mode: "all" };
+		return { kind: "pr-diff", repo, number: num, mode: "all", fetchedAt };
 	}
 	const idx = parsePositiveDecimalInt(sub);
 	if (idx === undefined) {
 		throw new Error(`Invalid pr:// diff sub-path '${sub}'. Use 'all' or a 1-indexed file number.`);
 	}
-	return { kind: "pr-diff", repo, number: num, mode: "slice", index: idx };
+	return { kind: "pr-diff", repo, number: num, mode: "slice", index: idx, fetchedAt };
+}
+
+function parsePinnedDiffGeneration(url: InternalUrl): number | undefined {
+	const raw = url.searchParams.get("at");
+	if (raw === null) return undefined;
+	const parsed = parsePositiveDecimalInt(raw);
+	if (parsed === undefined) {
+		throw new Error(`Invalid pr:// diff snapshot '${raw}'. Expected a positive integer cache generation.`);
+	}
+	return parsed;
+}
+
+function diffSnapshotQuery(fetchedAt: number | undefined): string {
+	return fetchedAt === undefined ? "" : `?at=${fetchedAt}`;
 }
 
 /**
@@ -410,10 +430,27 @@ function buildSingleResource({
 	};
 }
 
-function formatFileLine(idx: number, file: PrDiffFile, repo: string, prNumber: number): string {
+function formatFileLine(
+	idx: number,
+	file: PrDiffFile,
+	repo: string,
+	prNumber: number,
+	fetchedAt: number | undefined,
+): string {
 	const stats = file.changeType === "binary" ? "(binary)" : `+${file.additions} -${file.deletions}`;
 	const rename = file.oldPath ? `  (renamed from ${file.oldPath})` : "";
-	return `${idx}. ${file.path}  ${stats}  [${file.changeType}]${rename}\n   pr://${repo}/${prNumber}/diff/${idx}`;
+	const query = diffSnapshotQuery(fetchedAt);
+	return `${idx}. ${file.path}  ${stats}  [${file.changeType}]${rename}\n   pr://${repo}/${prNumber}/diff/${idx}${query}`;
+}
+
+function loadPinnedPrDiff(repo: string, number: number, fetchedAt: number) {
+	const pinned = getPinnedPrDiff({ repo, number, fetchedAt });
+	if (!pinned) {
+		throw new Error(
+			`pr://${repo}/${number}/diff?at=${fetchedAt} is not available. The pinned diff expired; run /review again.`,
+		);
+	}
+	return pinned;
 }
 
 async function fetchAndRenderPrDiff(
@@ -433,15 +470,20 @@ async function fetchAndRenderPrDiff(
 			);
 		}
 	}
-	const lookup = await getOrFetchPrDiff({
-		cwd,
-		repo,
-		number: parsed.number,
-		signal: context?.signal,
-		settings: context?.settings,
-	});
+	const lookup =
+		parsed.fetchedAt === undefined
+			? await getOrFetchPrDiff({
+					cwd,
+					repo,
+					number: parsed.number,
+					signal: context?.signal,
+					settings: context?.settings,
+				})
+			: loadPinnedPrDiff(repo, parsed.number, parsed.fetchedAt);
 	const files = lookup.payload.files;
 	const freshness = formatFreshnessNote(lookup.status, lookup.fetchedAt);
+	const query = diffSnapshotQuery(parsed.fetchedAt);
+	const pinnedNote = parsed.fetchedAt === undefined ? [] : ["Pinned snapshot"];
 
 	if (parsed.mode === "all") {
 		const content = lookup.payload.unified;
@@ -452,6 +494,7 @@ async function fetchAndRenderPrDiff(
 			size: Buffer.byteLength(content, "utf-8"),
 			notes: [
 				freshness,
+				...pinnedNote,
 				`Full diff for pr://${repo}/${parsed.number} (${files.length} file${files.length === 1 ? "" : "s"})`,
 			],
 		};
@@ -476,8 +519,9 @@ async function fetchAndRenderPrDiff(
 			size: Buffer.byteLength(content, "utf-8"),
 			notes: [
 				freshness,
+				...pinnedNote,
 				`Showing file ${index}/${files.length}: ${file.path}`,
-				`Read all: pr://${repo}/${parsed.number}/diff/all`,
+				`Read all: pr://${repo}/${parsed.number}/diff/all${query}`,
 			],
 		};
 	}
@@ -487,15 +531,15 @@ async function fetchAndRenderPrDiff(
 	const body =
 		files.length === 0
 			? "_No file changes._"
-			: files.map((f, i) => formatFileLine(i + 1, f, repo, parsed.number)).join("\n\n");
-	const footer = `\n\n---\nRead all: \`pr://${repo}/${parsed.number}/diff/all\`. Each file is also available as \`pr://${repo}/${parsed.number}/diff/<i>\`.`;
+			: files.map((f, i) => formatFileLine(i + 1, f, repo, parsed.number, parsed.fetchedAt)).join("\n\n");
+	const footer = `\n\n---\nRead all: \`pr://${repo}/${parsed.number}/diff/all${query}\`. Each file is also available as \`pr://${repo}/${parsed.number}/diff/<i>${query}\`.`;
 	const content = `${header}\n\n${body}${footer}`;
 	return {
 		url: url.href,
 		content,
 		contentType: "text/markdown",
 		size: Buffer.byteLength(content, "utf-8"),
-		notes: [freshness, `File listing for pr://${repo}/${parsed.number}`],
+		notes: [freshness, ...pinnedNote, `File listing for pr://${repo}/${parsed.number}`],
 	};
 }
 
